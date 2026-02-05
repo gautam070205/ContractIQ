@@ -27,8 +27,11 @@ from werkzeug.utils import secure_filename
 
 # Standard library imports
 import os                   # File system operations (paths, directories)
-from datetime import datetime  # Timestamps for unique filenames
+from datetime import datetime, timedelta  # Timestamps for unique filenames and JWT expiration
 import uuid                 # Generate unique identifiers
+
+# JWT for access token authentication
+import jwt
 
 # =============================================================================
 # IMPORT LOCAL MODULES
@@ -39,6 +42,7 @@ from database import (
     init_db,
     create_user,
     get_user_by_username,
+    get_user_by_email,
     get_user_by_id,
     save_document,
     get_user_documents,
@@ -204,12 +208,79 @@ def generate_unique_filename(original_filename):
     return unique_filename
 
 
+# =============================================================================
+# JWT TOKEN CONFIGURATION
+# =============================================================================
+
+# JWT token expiration time (24 hours)
+JWT_EXPIRATION_HOURS = 24
+
+# JWT algorithm
+JWT_ALGORITHM = 'HS256'
+
+
+def generate_access_token(user_id, username, role):
+    """
+    Generate a JWT access token for the user.
+    
+    The token contains user information and has an expiration time.
+    
+    Args:
+        user_id (int): The user's database ID
+        username (str): The user's username
+        role (str): The user's role
+    
+    Returns:
+        str: The encoded JWT token
+    """
+    payload = {
+        'user_id': user_id,
+        'username': username,
+        'role': role,
+        'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS),
+        'iat': datetime.utcnow()  # Issued at time
+    }
+    
+    token = jwt.encode(
+        payload,
+        app.config['SECRET_KEY'],
+        algorithm=JWT_ALGORITHM
+    )
+    
+    return token
+
+
+def verify_access_token(token):
+    """
+    Verify and decode a JWT access token.
+    
+    Args:
+        token (str): The JWT token to verify
+    
+    Returns:
+        dict: The decoded payload if valid, None otherwise
+    """
+    try:
+        payload = jwt.decode(
+            token,
+            app.config['SECRET_KEY'],
+            algorithms=[JWT_ALGORITHM]
+        )
+        return payload
+    except jwt.ExpiredSignatureError:
+        print("✗ Token expired")
+        return None
+    except jwt.InvalidTokenError as e:
+        print(f"✗ Invalid token: {e}")
+        return None
+
+
 def get_current_user():
     """
-    Get the currently logged-in user from the session.
+    Get the currently logged-in user from the session or access token.
     
-    This helper function retrieves the user ID from the session
-    and fetches the user's details from the database.
+    This helper function first checks for an access token in the Authorization header,
+    then falls back to checking the session cookie.
     
     Returns:
         dict: User data if logged in, None otherwise
@@ -219,18 +290,49 @@ def get_current_user():
         if not user:
             return jsonify({'error': 'Not authenticated'}), 401
     """
+    # First, try to get user from access token (Authorization header)
+    auth_header = request.headers.get('Authorization')
+    if auth_header and auth_header.startswith('Bearer '):
+        token = auth_header.split(' ', 1)[1]
+        payload = verify_access_token(token)
+        if payload:
+            return get_user_by_id(payload['user_id'])
+    
+    # Fall back to session-based authentication
     user_id = session.get('user_id')
     if not user_id:
         return None
     return get_user_by_id(user_id)
 
 
+def get_current_user_id():
+    """
+    Get the current user's ID from session or access token.
+    
+    Returns:
+        int: User ID if authenticated, None otherwise
+    """
+    # First, try to get user_id from access token (Authorization header)
+    auth_header = request.headers.get('Authorization')
+    if auth_header and auth_header.startswith('Bearer '):
+        token = auth_header.split(' ', 1)[1]
+        payload = verify_access_token(token)
+        if payload:
+            return payload['user_id']
+    
+    # Fall back to session-based authentication
+    return session.get('user_id')
+
+
 def login_required(f):
     """
     Decorator to protect routes that require authentication.
     
-    This decorator checks if a user is logged in before allowing
-    access to the decorated route. If not logged in, returns 401.
+    This decorator checks for authentication via:
+    1. JWT access token in Authorization header (Bearer token)
+    2. Session cookie (user_id in session)
+    
+    If neither is present or valid, returns 401 Unauthorized.
     
     Usage:
         @app.route('/protected')
@@ -242,12 +344,24 @@ def login_required(f):
     
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if 'user_id' not in session:
-            return jsonify({
-                'success': False,
-                'error': 'Authentication required. Please log in.'
-            }), 401
-        return f(*args, **kwargs)
+        # Try access token first
+        auth_header = request.headers.get('Authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            token = auth_header.split(' ', 1)[1]
+            payload = verify_access_token(token)
+            if payload:
+                # Token is valid, allow access
+                return f(*args, **kwargs)
+        
+        # Fall back to session-based authentication
+        if 'user_id' in session:
+            return f(*args, **kwargs)
+        
+        # Neither token nor session is valid
+        return jsonify({
+            'success': False,
+            'error': 'Authentication required. Please log in or provide a valid access token.'
+        }), 401
     
     return decorated_function
 
@@ -527,14 +641,15 @@ def register():
 @app.route('/api/login', methods=['POST'])
 def login():
     """
-    Authenticate a user and create a session.
+    Authenticate a user with email and create a session + access token.
     
-    This endpoint verifies user credentials and establishes a session
-    for subsequent authenticated requests.
+    This endpoint verifies user credentials and establishes both:
+    - A session cookie for web browser clients
+    - A JWT access token for API/mobile clients
     
     Request Body (JSON):
         {
-            "username": "string",    # Required: Username or email
+            "email": "string",       # Required: User's email address
             "password": "string"     # Required: User's password
         }
     
@@ -548,14 +663,15 @@ def login():
                     "username": "john_doe",
                     "email": "john@example.com",
                     "role": "client"
-                }
+                },
+                "access_token": "eyJhbGciOiJIUzI1NiIs..."
             }
         
         Error (400): Missing credentials
-            {"success": false, "error": "Username and password are required"}
+            {"success": false, "error": "Email and password are required"}
         
         Error (401): Invalid credentials
-            {"success": false, "error": "Invalid username or password"}
+            {"success": false, "error": "Invalid email or password"}
     
     Session:
         On successful login, the following are stored in the session:
@@ -563,9 +679,13 @@ def login():
         - username: The user's username
         - role: The user's role
     
+    Access Token:
+        A JWT token is returned that can be used in the Authorization header:
+        Authorization: Bearer <access_token>
+    
     Security Notes:
-        - Failed login attempts don't reveal whether username exists
-        - Same error message for wrong username and wrong password
+        - Failed login attempts don't reveal whether email exists
+        - Same error message for wrong email and wrong password
         - Password comparison uses constant-time comparison (via check_password_hash)
     """
     
@@ -583,30 +703,22 @@ def login():
     # Get JSON data from request body
     data = request.get_json()
     
-    # Extract credentials
-    username = data.get('username', '').strip()
+    # Extract credentials - now using email instead of username
+    email = data.get('email', '').strip().lower()  # Normalize email to lowercase
     password = data.get('password', '')
     
     # Validate that both fields are provided
-    if not username or not password:
+    if not email or not password:
         return jsonify({
             'success': False,
-            'error': 'Username and password are required'
+            'error': 'Email and password are required'
         }), 400
     
     # -------------------------------------------------------------------------
-    # Step 2: Fetch user from database
+    # Step 2: Fetch user from database by email
     # -------------------------------------------------------------------------
     
-    # Try to find user by username
-    user = get_user_by_username(username)
-    
-    # If not found by username, the user might have entered their email
-    # (Optional: Allow login with email as well)
-    if not user and '@' in username:
-        # This would require a get_user_by_email function
-        # For now, we only support username login
-        pass
+    user = get_user_by_email(email)
     
     # -------------------------------------------------------------------------
     # Step 3: Verify credentials
@@ -614,27 +726,27 @@ def login():
     
     # Check if user exists and password is correct
     # IMPORTANT: We use the same error message for both cases to prevent
-    # username enumeration attacks (attacker can't tell if username exists)
+    # email enumeration attacks (attacker can't tell if email exists)
     if not user:
         # User doesn't exist - but don't reveal this
-        print(f"✗ Login failed: User not found - {username}")
+        print(f"✗ Login failed: Email not found - {email}")
         return jsonify({
             'success': False,
-            'error': 'Invalid username or password'
+            'error': 'Invalid email or password'
         }), 401
     
     # Verify password against stored hash
     # check_password_hash uses constant-time comparison to prevent timing attacks
     if not check_password_hash(user['password_hash'], password):
         # Password doesn't match
-        print(f"✗ Login failed: Wrong password for user - {username}")
+        print(f"✗ Login failed: Wrong password for email - {email}")
         return jsonify({
             'success': False,
-            'error': 'Invalid username or password'
+            'error': 'Invalid email or password'
         }), 401
     
     # -------------------------------------------------------------------------
-    # Step 4: Create session
+    # Step 4: Create session (for cookie-based auth)
     # -------------------------------------------------------------------------
     
     # Clear any existing session data
@@ -650,10 +762,20 @@ def login():
     session.modified = True
     
     # -------------------------------------------------------------------------
-    # Step 5: Return success response
+    # Step 5: Generate JWT access token
     # -------------------------------------------------------------------------
     
-    print(f"✓ User logged in: {user['username']} (ID: {user['id']})")
+    access_token = generate_access_token(
+        user_id=user['id'],
+        username=user['username'],
+        role=user['role']
+    )
+    
+    # -------------------------------------------------------------------------
+    # Step 6: Return success response with access token
+    # -------------------------------------------------------------------------
+    
+    print(f"✓ User logged in: {user['username']} (ID: {user['id']}) via email: {email}")
     
     return jsonify({
         'success': True,
@@ -663,7 +785,8 @@ def login():
             'username': user['username'],
             'email': user['email'],
             'role': user['role']
-        }
+        },
+        'access_token': access_token
     }), 200
 
 
@@ -820,22 +943,21 @@ def dashboard():
     # Step 1: Check if user is authenticated
     # -------------------------------------------------------------------------
     # 
-    # The session object is a dictionary-like object that stores data
-    # specific to a user's browsing session. When a user logs in,
-    # we store their user_id in the session.
+    # We support dual authentication:
+    # 1. JWT access token in Authorization header (Bearer token)
+    # 2. Session cookie (user_id in session)
     #
-    # session.get('user_id') safely retrieves the value, returning None
-    # if the key doesn't exist (i.e., user is not logged in).
+    # get_current_user_id() checks both methods and returns the user_id.
     
-    user_id = session.get('user_id')
+    user_id = get_current_user_id()
     
-    # If user_id is not in session, the user is not logged in
+    # If user_id is not found via token or session, the user is not logged in
     if not user_id:
         # Return 401 Unauthorized status code
         # This tells the client they need to authenticate first
         return jsonify({
             'success': False,
-            'error': 'Not authenticated. Please log in.'
+            'error': 'Not authenticated. Please log in or provide a valid access token.'
         }), 401
     
     # -------------------------------------------------------------------------
@@ -972,13 +1094,14 @@ def upload_document():
     # -------------------------------------------------------------------------
     # Users must be logged in to upload documents
     # This ensures documents are associated with a user account
+    # Supports both cookie session and JWT access token authentication
     
-    user_id = session.get('user_id')
+    user_id = get_current_user_id()
     
     if not user_id:
         return jsonify({
             'success': False,
-            'error': 'Not authenticated. Please log in to upload documents.'
+            'error': 'Not authenticated. Please log in or provide a valid access token.'
         }), 401
     
     # -------------------------------------------------------------------------
@@ -1218,15 +1341,14 @@ def get_documents():
     # -------------------------------------------------------------------------
     # Step 1: Verify user is authenticated
     # -------------------------------------------------------------------------
-    # Check if user_id exists in the session (i.e., user is logged in)
+    # Check if user is authenticated via session cookie or access token
     
-    user_id = session.get('user_id')
-
+    user_id = get_current_user_id()
     
     if not user_id:
         return jsonify({
             'success': False,
-            'error': 'Not authenticated. Please log in.'
+            'error': 'Not authenticated. Please log in or provide a valid access token.'
         }), 401
     
     # -------------------------------------------------------------------------
@@ -1378,13 +1500,14 @@ def delete_document_route(document_id):
     # -------------------------------------------------------------------------
     # Step 1: Verify user is authenticated
     # -------------------------------------------------------------------------
+    # Supports both cookie session and JWT access token authentication
     
-    user_id = session.get('user_id')
+    user_id = get_current_user_id()
     
     if not user_id:
         return jsonify({
             'success': False,
-            'error': 'Not authenticated. Please log in.'
+            'error': 'Not authenticated. Please log in or provide a valid access token.'
         }), 401
     
     # -------------------------------------------------------------------------
@@ -1508,13 +1631,13 @@ def get_document_detail(document_id):
         Error (404): Document not found
     """
     
-    # Verify authentication
-    user_id = session.get('user_id')
+    # Verify authentication (supports both cookie session and JWT access token)
+    user_id = get_current_user_id()
     
     if not user_id:
         return jsonify({
             'success': False,
-            'error': 'Not authenticated. Please log in.'
+            'error': 'Not authenticated. Please log in or provide a valid access token.'
         }), 401
     
     # Fetch document with ownership check

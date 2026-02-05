@@ -242,6 +242,48 @@ def get_user_by_username(username):
         conn.close()
 
 
+def get_user_by_email(email):
+    """
+    Retrieve a user record by their email address.
+    
+    This function is used during login to fetch the user's
+    stored password hash for verification when logging in with email.
+    
+    Args:
+        email (str): The email address to search for
+    
+    Returns:
+        dict: User data as a dictionary with keys:
+              - id, username, email, password_hash, role, created_at
+              Returns None if user not found
+    
+    Example:
+        user = get_user_by_email('john@example.com')
+        if user:
+            print(f"Found user: {user['username']}")
+    """
+    conn = get_db_connection()
+    
+    try:
+        cursor = conn.execute(
+            'SELECT * FROM users WHERE email = ?',
+            (email.lower(),)  # Normalize email to lowercase
+        )
+        row = cursor.fetchone()
+        
+        # Convert Row object to dictionary, or return None if not found
+        if row:
+            return dict(row)
+        return None
+        
+    except sqlite3.Error as e:
+        print(f"✗ Error fetching user by email: {e}")
+        return None
+        
+    finally:
+        conn.close()
+
+
 def get_user_by_id(user_id):
     """
     Retrieve a user record by their ID.

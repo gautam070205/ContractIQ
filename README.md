@@ -57,8 +57,7 @@
 | **Flask-CORS** | Cross-Origin Resource Sharing | 4.0.0 |
 | **SQLite** | Database | Built-in |
 | **PyPDF2** | PDF Text Extraction | 3.0.1 |
-| **Werkzeug** | Password Hashing & Security | 3.0.1 |
-
+| **Werkzeug** | Password Hashing & Security | 3.0.1 || **PyJWT** | JWT Access Token Authentication | 2.8.0 |
 ### Why these technologies?
 
 - **Flask** - Lightweight, easy to learn, perfect for REST APIs
@@ -72,8 +71,10 @@
 
 ### 🔐 Authentication System
 - User registration with role-based access (admin/lawyer/client)
-- Secure login with password hashing
-- Session-based authentication
+- Secure login with **email and password**
+- **Dual authentication support:**
+  - Session-based (cookies) for web browsers
+  - JWT access tokens for API/mobile apps
 - Profile management
 
 ### 📄 Document Management
@@ -272,15 +273,20 @@ curl -X POST http://localhost:5000/api/register \
 
 **Endpoint:** `POST /api/login`
 
-**Description:** Authenticate and create a session
+**Description:** Authenticate with email and get session cookie + JWT access token
 
 **Request Body:**
 ```json
 {
-    "username": "john_doe",
+    "email": "john@example.com",
     "password": "securepassword123"
 }
 ```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| email | string | Yes | User's registered email address |
+| password | string | Yes | User's password |
 
 **Success Response (200):**
 ```json
@@ -292,7 +298,8 @@ curl -X POST http://localhost:5000/api/register \
         "username": "john_doe",
         "email": "john@example.com",
         "role": "lawyer"
-    }
+    },
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 }
 ```
 
@@ -300,7 +307,7 @@ curl -X POST http://localhost:5000/api/register \
 ```json
 {
     "success": false,
-    "error": "Invalid username or password"
+    "error": "Invalid email or password"
 }
 ```
 
@@ -308,11 +315,32 @@ curl -X POST http://localhost:5000/api/register \
 ```bash
 curl -X POST http://localhost:5000/api/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"john_doe","password":"secret123"}' \
+  -d '{"email":"john@example.com","password":"secret123"}' \
   -c cookies.txt
 ```
 
-> 💡 **Note:** The `-c cookies.txt` saves the session cookie for subsequent requests.
+> 💡 **Note:** The response includes both:
+> - **Session cookie** - Automatically saved with `-c cookies.txt` for browser-like requests
+> - **Access token** - Use in `Authorization: Bearer <token>` header for API/mobile requests
+
+---
+
+### 🔑 Using Access Tokens
+
+After login, you can authenticate requests using either method:
+
+**Method 1: Session Cookie (Web Browsers)**
+```bash
+curl -X GET http://localhost:5000/api/documents -b cookies.txt
+```
+
+**Method 2: Access Token (API/Mobile Apps)**
+```bash
+curl -X GET http://localhost:5000/api/documents \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+```
+
+> ⏰ **Token Expiration:** Access tokens expire after 24 hours. Re-login to get a new token.
 
 ---
 
@@ -623,14 +651,18 @@ curl -X POST http://localhost:5000/api/register `
   -H "Content-Type: application/json" `
   -d '{"username":"testuser","email":"test@example.com","password":"test123"}'
 
-# 2. Login (save session cookie)
+# 2. Login with email (save session cookie)
+# Response includes access_token for API/mobile use
 curl -X POST http://localhost:5000/api/login `
   -H "Content-Type: application/json" `
-  -d '{"username":"testuser","password":"test123"}' `
+  -d '{"email":"test@example.com","password":"test123"}' `
   -c cookies.txt
 
-# 3. Check dashboard
+# 3. Check dashboard (using cookie)
 curl -X GET http://localhost:5000/api/dashboard -b cookies.txt
+
+# 3b. Or use access token instead of cookie
+# curl -X GET http://localhost:5000/api/dashboard -H "Authorization: Bearer YOUR_TOKEN_HERE"
 
 # 4. Upload a PDF (replace path)
 curl -X POST http://localhost:5000/api/upload `
@@ -666,21 +698,31 @@ response = session.post(f"{base_url}/api/register", json={
 })
 print("Register:", response.json())
 
-# Login
+# Login with email (session-based)
 response = session.post(f"{base_url}/api/login", json={
-    "username": "testuser",
+    "email": "test@example.com",
     "password": "test123"
 })
-print("Login:", response.json())
+login_data = response.json()
+print("Login:", login_data)
 
-# Upload PDF
+# Get the access token for API/mobile use
+access_token = login_data.get("access_token")
+print("Access Token:", access_token)
+
+# Upload PDF (using session cookie)
 with open("contract.pdf", "rb") as f:
     response = session.post(f"{base_url}/api/upload", files={"file": f})
 print("Upload:", response.json())
 
-# Get documents
+# Get documents (using session cookie)
 response = session.get(f"{base_url}/api/documents")
 print("Documents:", response.json())
+
+# Alternative: Use access token instead of session
+headers = {"Authorization": f"Bearer {access_token}"}
+response = requests.get(f"{base_url}/api/documents", headers=headers)
+print("Documents (via token):", response.json())
 ```
 
 ---
@@ -769,7 +811,7 @@ python app.py
 
 **Problem:** Login works but subsequent requests say "Not authenticated"
 
-**Solution:** Make sure you're including cookies in requests:
+**Solution 1: Use cookies properly**
 ```bash
 # Save cookies on login
 curl -X POST http://localhost:5000/api/login ... -c cookies.txt
@@ -778,7 +820,19 @@ curl -X POST http://localhost:5000/api/login ... -c cookies.txt
 curl -X GET http://localhost:5000/api/dashboard -b cookies.txt
 ```
 
-For Postman: Enable "Send cookies" in settings.
+**Solution 2: Use access token instead**
+```bash
+# Login and save the access_token from the response
+curl -X POST http://localhost:5000/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"test123"}'
+
+# Use the token in subsequent requests
+curl -X GET http://localhost:5000/api/dashboard \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN_HERE"
+```
+
+For Postman: Enable "Send cookies" in settings, or use the Authorization tab with Bearer Token.
 
 ---
 
@@ -790,7 +844,7 @@ Here are planned features for future versions:
 
 - [ ] 🤖 **AI-Powered Analysis** - Use OpenAI/Claude for smarter clause extraction
 - [ ] 📧 **Email Verification** - Verify user emails on registration
-- [ ] 🔑 **JWT Authentication** - Token-based auth for mobile apps
+- [x] 🔑 **JWT Authentication** - ✅ Token-based auth for mobile apps (COMPLETED!)
 - [ ] 📱 **React Frontend** - Modern web interface
 
 ### Version 3.0

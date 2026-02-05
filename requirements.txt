@@ -11,3 +11,6 @@ PyPDF2==3.0.1
 
 # Security utilities (password hashing, secure filenames)
 Werkzeug==3.0.1
+
+# JWT authentication for access tokens
+PyJWT==2.8.0
